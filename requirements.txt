@@ -1,0 +1,7 @@
+neo4j
+openai
+pinecone
+pyvis
+networkx
+tqdm
+python-dotenv
