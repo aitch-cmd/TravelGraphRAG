@@ -8,6 +8,7 @@ __pycache__/
 vietnam_travel_dataset.json
 
 config.py
+.env
 
 # Distribution / packaging
 .Python

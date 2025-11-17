@@ -13,7 +13,6 @@ def create_constraints(tx):
     Define uniqueness constraint on nodes labeled 'Entity' ensuring their 'id' property is unique.
     This prevents duplicate nodes with the same ID.
     """
-    # generic uniqueness constraint on id for node label Entity (we also add label specific types)
     tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Entity) REQUIRE n.id IS UNIQUE")
 
 def upsert_node(tx, node):
