@@ -1,149 +1,256 @@
-# hybrid_chat.py
-import json
-from typing import List
+from typing import List, Dict, Any
 from openai import OpenAI
-from pinecone import Pinecone, ServerlessSpec
-from neo4j import GraphDatabase
 import config
+from logger import get_logger
+from services.vector_db_service import vector_db_service
+from services.graph_db_service import graph_db_service
 
-# -----------------------------
-# Config
-# -----------------------------
-EMBED_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "gpt-4o-mini"
-TOP_K = 5
+logger = get_logger(__name__)
 
-INDEX_NAME = config.PINECONE_INDEX_NAME
-
-# -----------------------------
-# Initialize clients
-# -----------------------------
-client = OpenAI(api_key=config.OPENAI_API_KEY)
-pc = Pinecone(api_key=config.PINECONE_API_KEY)
-
-# Connect to Pinecone index
-if INDEX_NAME not in pc.list_indexes().names():
-    print(f"Creating managed index: {INDEX_NAME}")
-    pc.create_index(
-        name=INDEX_NAME,
-        dimension=config.PINECONE_VECTOR_DIM,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east1")
-    )
-
-index = pc.Index(INDEX_NAME)
-
-# Connect to Neo4j
-driver = GraphDatabase.driver(
-    config.NEO4J_URI, auth=(config.NEO4J_USER, config.NEO4J_PASSWORD)
-)
-
-# -----------------------------
-# Helper functions
-# -----------------------------
-def embed_text(text: str) -> List[float]:
-    """Get embedding for a text string."""
-    resp = client.embeddings.create(model=EMBED_MODEL, input=[text])
-    return resp.data[0].embedding
-
-def pinecone_query(query_text: str, top_k=TOP_K):
-    """Query Pinecone index using embedding."""
-    vec = embed_text(query_text)
-    res = index.query(
-        vector=vec,
-        top_k=top_k,
-        include_metadata=True,
-        include_values=False
-    )
-    print("DEBUG: Pinecone top 5 results:")
-    print(len(res["matches"]))
-    return res["matches"]
-
-def fetch_graph_context(node_ids: List[str], neighborhood_depth=1):
-    """Fetch neighboring nodes from Neo4j."""
-    facts = []
-    with driver.session() as session:
-        for nid in node_ids:
-            q = (
-                "MATCH (n:Entity {id:$nid})-[r]-(m:Entity) "
-                "RETURN type(r) AS rel, labels(m) AS labels, m.id AS id, "
-                "m.name AS name, m.type AS type, m.description AS description "
-                "LIMIT 10"
+class HybridChatService:
+    """Service for hybrid RAG chat combining vector and graph databases."""
+    
+    def __init__(self, chat_model: str = config.CHAT_MODEL):
+        """
+        Initialize hybrid chat service.
+        
+        Args:
+            chat_model: OpenAI chat model to use
+        """
+        self.chat_model = chat_model
+        self.client = OpenAI(api_key=config.OPENAI_API_KEY)
+        logger.info(f"Initialized HybridChatService with model: {chat_model}")
+    
+    def retrieve_context(
+        self,
+        query: str,
+        top_k: int = config.TOP_K,
+        graph_depth: int = 1
+    ) -> Dict[str, Any]:
+        """
+        Retrieve context from both vector and graph databases.
+        
+        Args:
+            query: User query
+            top_k: Number of vector search results
+            graph_depth: Depth of graph traversal
+            
+        Returns:
+            Dictionary with vector matches and graph facts
+        """
+        logger.info(f"Retrieving context for query: {query[:50]}...")
+        
+        # 1. Vector search
+        logger.debug("Performing vector search")
+        vector_matches = vector_db_service.search(
+            query_text=query,
+            top_k=top_k,
+            include_metadata=True
+        )
+        logger.info(f"Retrieved {len(vector_matches)} vector matches")
+        
+        # 2. Extract node IDs from matches
+        node_ids = [match["id"] for match in vector_matches]
+        
+        # 3. Graph context retrieval
+        logger.debug("Fetching graph context")
+        graph_facts = graph_db_service.fetch_multi_neighborhood(
+            node_ids=node_ids,
+            depth=graph_depth,
+            limit_per_node=10
+        )
+        logger.info(f"Retrieved {len(graph_facts)} graph facts")
+        
+        return {
+            "vector_matches": vector_matches,
+            "graph_facts": graph_facts,
+            "query": query
+        }
+    
+    def build_prompt(
+        self,
+        query: str,
+        vector_matches: List[Dict[str, Any]],
+        graph_facts: List[Dict[str, Any]]
+    ) -> List[Dict[str, str]]:
+        """
+        Build chat prompt from retrieved context.
+        
+        Args:
+            query: User query
+            vector_matches: Results from vector search
+            graph_facts: Results from graph traversal
+            
+        Returns:
+            List of messages for chat completion
+        """
+        # System message
+        system_msg = (
+            "You are a helpful travel assistant for Vietnam. "
+            "Use the provided semantic search results and graph facts to answer "
+            "the user's query briefly and concisely. "
+            "Cite node IDs when referencing specific places or attractions."
+        )
+        
+        # Build vector context
+        vec_context = []
+        for match in vector_matches:
+            meta = match["metadata"]
+            score = match.get("score", 0.0)
+            snippet = (
+                f"- ID: {match['id']}, "
+                f"Name: {meta.get('name', 'N/A')}, "
+                f"Type: {meta.get('type', 'N/A')}, "
+                f"Score: {score:.3f}"
             )
-            recs = session.run(q, nid=nid)
-            for r in recs:
-                facts.append({
-                    "source": nid,
-                    "rel": r["rel"],
-                    "target_id": r["id"],
-                    "target_name": r["name"],
-                    "target_desc": (r["description"] or "")[:400],
-                    "labels": r["labels"]
-                })
-    print("DEBUG: Graph facts:")
-    print(len(facts))
-    return facts
+            if meta.get("city"):
+                snippet += f", City: {meta.get('city')}"
+            vec_context.append(snippet)
+        
+        # Build graph context
+        graph_context = [
+            f"- ({fact['source']}) -[{fact['rel']}]-> "
+            f"({fact['target_id']}) {fact['target_name']}: "
+            f"{fact['target_desc']}"
+            for fact in graph_facts
+        ]
+        
+        # User message with context
+        user_content = (
+            f"User query: {query}\n\n"
+            "Top semantic matches (from vector DB):\n"
+            f"{chr(10).join(vec_context[:10])}\n\n"
+            "Graph facts (neighboring relations):\n"
+            f"{chr(10).join(graph_context[:20])}\n\n"
+            "Based on the above context, answer the user's question. "
+            "If helpful, suggest 2-3 concrete itinerary steps or tips and "
+            "mention node IDs for references."
+        )
+        
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_content}
+        ]
+        
+        logger.debug(f"Built prompt with {len(vec_context)} vector matches and {len(graph_context)} graph facts")
+        return messages
+    
+    def generate_response(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 600,
+        temperature: float = 0.2
+    ) -> str:
+        """
+        Generate chat response using OpenAI API.
+        
+        Args:
+            messages: List of chat messages
+            max_tokens: Maximum tokens in response
+            temperature: Sampling temperature
+            
+        Returns:
+            Generated response text
+        """
+        try:
+            logger.debug("Generating chat response")
+            response = self.client.chat.completions.create(
+                model=self.chat_model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            
+            answer = response.choices[0].message.content
+            logger.info(f"Generated response ({len(answer)} chars)")
+            return answer
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            raise
+    
+    def chat(self, query: str, top_k: int = config.TOP_K) -> Dict[str, Any]:
+        """
+        Complete chat flow: retrieve context, build prompt, generate response.
+        
+        Args:
+            query: User query
+            top_k: Number of vector search results
+            
+        Returns:
+            Dictionary with query, answer, and context
+        """
+        try:
+            # Retrieve context
+            context = self.retrieve_context(query, top_k=top_k)
+            
+            # Build prompt
+            messages = self.build_prompt(
+                query=query,
+                vector_matches=context["vector_matches"],
+                graph_facts=context["graph_facts"]
+            )
+            
+            # Generate response
+            answer = self.generate_response(messages)
+            
+            return {
+                "query": query,
+                "answer": answer,
+                "vector_matches": context["vector_matches"],
+                "graph_facts": context["graph_facts"]
+            }
+        except Exception as e:
+            logger.error(f"Error in chat: {e}")
+            return {
+                "query": query,
+                "answer": f"Error: {str(e)}",
+                "vector_matches": [],
+                "graph_facts": []
+            }
 
-def build_prompt(user_query, pinecone_matches, graph_facts):
-    """Build a chat prompt combining vector DB matches and graph facts."""
-    system = (
-        "You are a helpful travel assistant. Use the provided semantic search results "
-        "and graph facts to answer the user's query briefly and concisely. "
-        "Cite node ids when referencing specific places or attractions."
-    )
 
-    vec_context = []
-    for m in pinecone_matches:
-        meta = m["metadata"]
-        score = m.get("score", None)
-        snippet = f"- id: {m['id']}, name: {meta.get('name','')}, type: {meta.get('type','')}, score: {score}"
-        if meta.get("city"):
-            snippet += f", city: {meta.get('city')}"
-        vec_context.append(snippet)
-
-    graph_context = [
-        f"- ({f['source']}) -[{f['rel']}]-> ({f['target_id']}) {f['target_name']}: {f['target_desc']}"
-        for f in graph_facts
-    ]
-
-    prompt = [
-        {"role": "system", "content": system},
-        {"role": "user", "content":
-         f"User query: {user_query}\n\n"
-         "Top semantic matches (from vector DB):\n" + "\n".join(vec_context[:10]) + "\n\n"
-         "Graph facts (neighboring relations):\n" + "\n".join(graph_context[:20]) + "\n\n"
-         "Based on the above, answer the user's question. If helpful, suggest 2–3 concrete itinerary steps or tips and mention node ids for references."}
-    ]
-    return prompt
-
-def call_chat(prompt_messages):
-    """Call OpenAI ChatCompletion."""
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=prompt_messages,
-        max_tokens=600,
-        temperature=0.2
-    )
-    return resp.choices[0].message.content
-
-# -----------------------------
-# Interactive chat
-# -----------------------------
 def interactive_chat():
-    print("Hybrid travel assistant. Type 'exit' to quit.")
+    """Run interactive chat session."""
+    chat_service = HybridChatService()
+    
+    print("\n" + "="*60)
+    print("Hybrid Travel Assistant (Vietnam)")
+    print("Type 'exit' or 'quit' to end the session")
+    print("="*60 + "\n")
+    
     while True:
-        query = input("\nEnter your travel question: ").strip()
-        if not query or query.lower() in ("exit","quit"):
+        try:
+            query = input("\n🔍 Your question: ").strip()
+            
+            if not query:
+                continue
+            
+            if query.lower() in ("exit", "quit"):
+                print("\n👋 Goodbye!")
+                break
+            
+            # Get response
+            result = chat_service.chat(query)
+            
+            # Display answer
+            print("\n" + "="*60)
+            print("🤖 Assistant Answer:")
+            print("-"*60)
+            print(result["answer"])
+            print("="*60)
+            
+            # Display source info
+            if result.get("vector_matches"):
+                print(f"\n📊 Sources: {len(result['vector_matches'])} vector matches, "
+                      f"{len(result['graph_facts'])} graph connections")
+        
+        except KeyboardInterrupt:
+            print("\n\n👋 Goodbye!")
             break
+        except Exception as e:
+            logger.error(f"Error in interactive chat: {e}")
+            print(f"\n❌ Error: {e}")
 
-        matches = pinecone_query(query, top_k=TOP_K)
-        match_ids = [m["id"] for m in matches]
-        graph_facts = fetch_graph_context(match_ids)
-        prompt = build_prompt(query, matches, graph_facts)
-        answer = call_chat(prompt)
-        print("\n=== Assistant Answer ===\n")
-        print(answer)
-        print("\n=== End ===\n")
 
 if __name__ == "__main__":
     interactive_chat()
