@@ -5,3 +5,6 @@ pyvis
 networkx
 tqdm
 python-dotenv
+azure-storage-blob
+azure-core
+
